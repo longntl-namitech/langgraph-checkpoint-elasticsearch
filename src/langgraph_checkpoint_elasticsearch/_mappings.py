@@ -15,7 +15,7 @@ CHECKPOINTS_MAPPING: dict = {
             "metadata_type": _KEYWORD,
             "checkpoint_data": {"type": "binary"},
             "metadata_data": {"type": "binary"},
-            "metadata": {"type": "flattened"},
+            "metadata": {"type": "flattened", "ignore_above": 8191},
             "created_at": {"type": "date"},
         }
     }
