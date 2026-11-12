@@ -156,7 +156,25 @@ async def test_graph_resume_with_subgraph(es_client, index_prefix):
     r2 = await app2.ainvoke({"items": ["b"]}, cfg)
     assert r2["items"] == ["b", "inner", "outer"]
     history = [s async for s in app2.aget_state_history(cfg)]
-    assert len(history) > 4
+    assert len(history) == 8  # 4 root checkpoints per run, two runs
+
+    # Q4: a subgraph-namespace checkpoint with an empty-string key in
+    # metadata.parents must really have been indexed.
+    index = first.checkpoints_index
+    resp = await es_client.search(
+        index=index,
+        query={"bool": {"must_not": [{"term": {"checkpoint_ns": ""}}]}},
+        size=100,
+    )
+    assert resp["hits"]["total"]["value"] > 0
+    assert any("" in h["_source"]["metadata"].get("parents", {}) for h in resp["hits"]["hits"])
+    saver2 = make()
+    found = [
+        t
+        async for t in saver2.alist(None)
+        if t.config["configurable"]["checkpoint_ns"] != "" and "" in t.metadata.get("parents", {})
+    ]
+    assert found
 
 
 async def test_sync_methods_raise(saver):

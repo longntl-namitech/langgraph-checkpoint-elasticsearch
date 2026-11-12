@@ -8,7 +8,6 @@ from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 from elasticsearch import AsyncElasticsearch, BadRequestError, NotFoundError
-from elasticsearch.exceptions import ConflictError
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import (
     WRITES_IDX_MAP,
@@ -155,6 +154,7 @@ class AsyncElasticsearchSaver(BaseCheckpointSaver[str]):
         checkpoint_id = configurable["checkpoint_id"]
         tenant_id, user_id = self._identity(config)
 
+        operations: list[dict[str, Any]] = []
         for i, (channel, value) in enumerate(writes):
             idx = WRITES_IDX_MAP.get(channel, i)
             value_type, value_bytes = self.serde.dumps_typed(value)
@@ -175,22 +175,23 @@ class AsyncElasticsearchSaver(BaseCheckpointSaver[str]):
             doc_id = write_doc_id(
                 thread_id, checkpoint_ns, checkpoint_id, task_id, idx, tenant_id, user_id
             )
-            if idx >= 0:
-                # Regular writes are first-write-wins, like InMemorySaver.
-                try:
-                    await self.client.index(
-                        index=self.writes_index,
-                        id=doc_id,
-                        document=doc,
-                        op_type="create",
-                        refresh=self.refresh,
-                    )
-                except ConflictError:
-                    pass
-            else:
-                await self.client.index(
-                    index=self.writes_index, id=doc_id, document=doc, refresh=self.refresh
-                )
+            # Regular writes are first-write-wins (create), like InMemorySaver;
+            # special channels (negative idx) overwrite.
+            action = "create" if idx >= 0 else "index"
+            operations.append({action: {"_index": self.writes_index, "_id": doc_id}})
+            operations.append(doc)
+        if not operations:
+            return
+
+        # One bulk call so "wait_for" costs one refresh interval, not one per write.
+        response = await self.client.bulk(operations=operations, refresh=self.refresh)
+        if response["errors"]:
+            for item in response["items"]:
+                ((action, result),) = item.items()
+                status = result.get("status", 0)
+                if status < 300 or (action == "create" and status == 409):
+                    continue
+                raise RuntimeError(f"Failed to write checkpoint writes: {result.get('error')}")
 
     # Reads
 
