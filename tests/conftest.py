@@ -12,8 +12,10 @@ async def es_client():
     client = AsyncElasticsearch(os.environ.get("ES_URL", "http://localhost:9200"))
     try:
         if not await client.ping():
+            await client.close()
             pytest.skip("Elasticsearch is not reachable")
     except ESConnectionError:
+        await client.close()
         pytest.skip("Elasticsearch is not reachable")
     except BaseException:
         await client.close()
@@ -28,4 +30,6 @@ async def es_client():
 async def index_prefix(es_client):
     prefix = f"test_{uuid.uuid4().hex[:8]}_"
     yield prefix
-    await es_client.indices.delete(index=f"{prefix}*", ignore_unavailable=True)
+    found = await es_client.indices.get(index=f"{prefix}*", ignore_unavailable=True)
+    if found:
+        await es_client.indices.delete(index=list(found), ignore_unavailable=True)
