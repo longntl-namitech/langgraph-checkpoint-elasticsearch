@@ -27,6 +27,7 @@ from langgraph_checkpoint_elasticsearch._mappings import (
     checkpoint_doc_id,
     write_doc_id,
 )
+from langgraph_checkpoint_elasticsearch.errors import ScopeError
 
 logger = logging.getLogger(__name__)
 
@@ -80,16 +81,27 @@ class AsyncElasticsearchSaver(BaseCheckpointSaver[str]):
                 if exc.error != "resource_already_exists_exception":
                     raise
 
-    # Identity hooks: tenant/user scoping plugs in here (no behaviour when unscoped).
+    # Identity: with scoping on, tenant_id/user_id come from config["configurable"].
 
     def _identity(self, config: RunnableConfig | None) -> tuple[str | None, str | None]:
-        return None, None
+        if not self.scoping:
+            return None, None
+        configurable = (config or {}).get("configurable") or {}
+        tenant_id = configurable.get("tenant_id")
+        user_id = configurable.get("user_id")
+        if not tenant_id or not user_id:
+            raise ScopeError("scoping is on: config['configurable'] needs tenant_id and user_id")
+        return tenant_id, user_id
 
     def _identity_filters(self, tenant_id: str | None, user_id: str | None) -> list[dict]:
-        return []
+        if tenant_id is None or user_id is None:
+            return []
+        return [{"term": {"tenant_id": tenant_id}}, {"term": {"user_id": user_id}}]
 
     def _identity_config(self, tenant_id: str | None, user_id: str | None) -> dict[str, str]:
-        return {}
+        if tenant_id is None or user_id is None:
+            return {}
+        return {"tenant_id": tenant_id, "user_id": user_id}
 
     # Writes
 
@@ -122,9 +134,7 @@ class AsyncElasticsearchSaver(BaseCheckpointSaver[str]):
             "metadata": json.loads(json.dumps(merged, default=str)),
             "created_at": checkpoint.get("ts"),
         }
-        if tenant_id is not None and user_id is not None:
-            doc["tenant_id"] = tenant_id
-            doc["user_id"] = user_id
+        doc.update(self._identity_config(tenant_id, user_id))
 
         await self.client.index(
             index=self.checkpoints_index,
@@ -169,9 +179,7 @@ class AsyncElasticsearchSaver(BaseCheckpointSaver[str]):
                 "value_type": value_type,
                 "value": _b64(value_bytes),
             }
-            if tenant_id is not None and user_id is not None:
-                doc["tenant_id"] = tenant_id
-                doc["user_id"] = user_id
+            doc.update(self._identity_config(tenant_id, user_id))
             doc_id = write_doc_id(
                 thread_id, checkpoint_ns, checkpoint_id, task_id, idx, tenant_id, user_id
             )
@@ -232,7 +240,7 @@ class AsyncElasticsearchSaver(BaseCheckpointSaver[str]):
             if not hits:
                 return None
             source = hits[0]["_source"]
-        return await self._to_tuple(source, tenant_id, user_id)
+        return await self._to_tuple(source)
 
     async def alist(
         self,
@@ -244,10 +252,9 @@ class AsyncElasticsearchSaver(BaseCheckpointSaver[str]):
     ) -> AsyncIterator[CheckpointTuple]:
         filters: list[dict] = []
         must_not: list[dict] = []
-        tenant_id = user_id = None
+        tenant_id, user_id = self._identity(config) if (config or self.scoping) else (None, None)
         if config:
             configurable = config["configurable"]
-            tenant_id, user_id = self._identity(config)
             filters.extend(self._identity_filters(tenant_id, user_id))
             if (thread_id := configurable.get("thread_id")) is not None:
                 filters.append({"term": {"thread_id": thread_id}})
@@ -284,7 +291,7 @@ class AsyncElasticsearchSaver(BaseCheckpointSaver[str]):
             )
             hits = response["hits"]["hits"]
             for hit in hits:
-                yield await self._to_tuple(hit["_source"], tenant_id, user_id)
+                yield await self._to_tuple(hit["_source"])
             if remaining is not None:
                 remaining -= len(hits)
                 if remaining <= 0:
@@ -293,9 +300,12 @@ class AsyncElasticsearchSaver(BaseCheckpointSaver[str]):
                 return
             search_after = hits[-1]["sort"]
 
-    async def _to_tuple(
-        self, source: dict[str, Any], tenant_id: str | None, user_id: str | None
-    ) -> CheckpointTuple:
+    async def _to_tuple(self, source: dict[str, Any]) -> CheckpointTuple:
+        # Identity comes from the stored doc, never from the request config.
+        if self.scoping:
+            tenant_id, user_id = source.get("tenant_id"), source.get("user_id")
+        else:
+            tenant_id = user_id = None
         thread_id = source["thread_id"]
         checkpoint_ns = source["checkpoint_ns"]
         checkpoint = self.serde.loads_typed(
@@ -382,6 +392,22 @@ class AsyncElasticsearchSaver(BaseCheckpointSaver[str]):
                 query={"term": {"thread_id": thread_id}},
                 refresh=True,
                 conflicts="proceed",
+            )
+
+    async def adelete_scoped_thread(self, thread_id: str, tenant_id: str, user_id: str) -> None:
+        """Delete one thread of one tenant and user; other tenants' threads stay."""
+        query = {
+            "bool": {
+                "filter": [
+                    {"term": {"thread_id": thread_id}},
+                    {"term": {"tenant_id": tenant_id}},
+                    {"term": {"user_id": user_id}},
+                ]
+            }
+        }
+        for index in (self.checkpoints_index, self.writes_index):
+            await self.client.delete_by_query(
+                index=index, query=query, refresh=True, conflicts="proceed"
             )
 
     def get_next_version(self, current: str | None, channel: None) -> str:
