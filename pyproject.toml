@@ -1,0 +1,43 @@
+[project]
+name = "langgraph-checkpoint-elasticsearch"
+version = "0.1.0"
+description = "Async LangGraph checkpoint saver on Elasticsearch"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Nguyễn Thành Long", email = "long.itptit@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=1",
+    "langgraph-checkpoint>=4",
+    "elasticsearch[async]>=8,<10",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.19,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.1",
+    "ruff>=0.17.3",
+    "langgraph-checkpoint-conformance",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: needs a running Elasticsearch (ES_URL, default http://localhost:9200)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
