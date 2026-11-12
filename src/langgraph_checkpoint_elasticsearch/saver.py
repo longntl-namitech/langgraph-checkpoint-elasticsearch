@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import json
-import logging
 import random
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
@@ -28,8 +27,6 @@ from langgraph_checkpoint_elasticsearch._mappings import (
     write_doc_id,
 )
 from langgraph_checkpoint_elasticsearch.errors import ScopeError
-
-logger = logging.getLogger(__name__)
 
 _LIST_PAGE_SIZE = 100
 _WRITES_PAGE_SIZE = 1000
@@ -194,12 +191,18 @@ class AsyncElasticsearchSaver(BaseCheckpointSaver[str]):
         # One bulk call so "wait_for" costs one refresh interval, not one per write.
         response = await self.client.bulk(operations=operations, refresh=self.refresh)
         if response["errors"]:
+            failures = []
             for item in response["items"]:
                 ((action, result),) = item.items()
                 status = result.get("status", 0)
                 if status < 300 or (action == "create" and status == 409):
                     continue
-                raise RuntimeError(f"Failed to write checkpoint writes: {result.get('error')}")
+                error_type = (result.get("error") or {}).get("type", "unknown")
+                failures.append(f"status {status}: {error_type}")
+            if failures:
+                shown = "; ".join(failures[:5])
+                more = f" (first 5 of {len(failures)})" if len(failures) > 5 else ""
+                raise RuntimeError(f"Failed to write checkpoint writes{more}: {shown}")
 
     # Reads
 
@@ -385,17 +388,27 @@ class AsyncElasticsearchSaver(BaseCheckpointSaver[str]):
                 return result
             search_after = hits[-1]["sort"]
 
+    async def _delete_by_query(self, index: str, query: dict) -> None:
+        # conflicts="proceed" skips documents changed mid-delete; retry once, then fail loudly.
+        for _ in range(2):
+            resp = await self.client.delete_by_query(
+                index=index, query=query, refresh=True, conflicts="proceed"
+            )
+            remaining = resp.get("version_conflicts", 0)
+            if not remaining:
+                return
+        raise RuntimeError(
+            f"Delete left {remaining} documents behind in index {index} (version conflicts)"
+        )
+
     async def adelete_thread(self, thread_id: str) -> None:
         for index in (self.checkpoints_index, self.writes_index):
-            await self.client.delete_by_query(
-                index=index,
-                query={"term": {"thread_id": thread_id}},
-                refresh=True,
-                conflicts="proceed",
-            )
+            await self._delete_by_query(index, {"term": {"thread_id": thread_id}})
 
     async def adelete_scoped_thread(self, thread_id: str, tenant_id: str, user_id: str) -> None:
         """Delete one thread of one tenant and user; other tenants' threads stay."""
+        if not thread_id or not tenant_id or not user_id:
+            raise ValueError("thread_id, tenant_id and user_id must be non-empty")
         query = {
             "bool": {
                 "filter": [
@@ -406,9 +419,7 @@ class AsyncElasticsearchSaver(BaseCheckpointSaver[str]):
             }
         }
         for index in (self.checkpoints_index, self.writes_index):
-            await self.client.delete_by_query(
-                index=index, query=query, refresh=True, conflicts="proceed"
-            )
+            await self._delete_by_query(index, query)
 
     def get_next_version(self, current: str | None, channel: None) -> str:
         if current is None:

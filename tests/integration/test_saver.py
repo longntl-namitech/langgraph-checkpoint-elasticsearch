@@ -180,3 +180,14 @@ async def test_graph_resume_with_subgraph(es_client, index_prefix):
 async def test_sync_methods_raise(saver):
     with pytest.raises(NotImplementedError, match="async only"):
         saver.get_tuple(_cfg())
+
+
+async def test_long_configurable_value_does_not_break_put(saver):
+    long_value = "x" * 40_000
+    cp = _cp(1)
+    md = {"source": "input", "step": -1, "parents": {}, "note": long_value}
+    cfg = {"configurable": {"thread_id": "t1", "checkpoint_ns": "", "long": long_value}}
+    out = await saver.aput(cfg, cp, md, {})
+    tup = await saver.aget_tuple(out)
+    assert tup.checkpoint == cp
+    assert tup.metadata["note"] == long_value

@@ -13,15 +13,35 @@ pip install git+https://github.com/longntl-namitech/langgraph-checkpoint-elastic
 ## Quickstart
 
 ```python
+import asyncio
+from typing import TypedDict
+
 from elasticsearch import AsyncElasticsearch
+from langgraph.graph import END, START, StateGraph
+
 from langgraph_checkpoint_elasticsearch import AsyncElasticsearchSaver
 
-client = AsyncElasticsearch("http://localhost:9200")
-saver = AsyncElasticsearchSaver(client)
-await saver.setup()  # creates the indexes if they are missing
 
-graph = builder.compile(checkpointer=saver)
-result = await graph.ainvoke({"messages": []}, {"configurable": {"thread_id": "demo"}})
+class State(TypedDict):
+    count: int
+
+
+async def main():
+    client = AsyncElasticsearch("http://localhost:9200")
+    saver = AsyncElasticsearchSaver(client)
+    await saver.setup()  # creates the indexes if they are missing
+
+    builder = StateGraph(State)
+    builder.add_node("inc", lambda s: {"count": s["count"] + 1})
+    builder.add_edge(START, "inc")
+    builder.add_edge("inc", END)
+    graph = builder.compile(checkpointer=saver)
+
+    print(await graph.ainvoke({"count": 0}, {"configurable": {"thread_id": "demo"}}))
+    await client.close()
+
+
+asyncio.run(main())
 ```
 
 Runnable versions are in `examples/`: `resume.py` resumes a thread with a new client and saver, `scoping.py` shows two users on one `thread_id`. Both need only a local Elasticsearch (`ES_URL`, default `http://localhost:9200`), no LLM.
@@ -30,7 +50,9 @@ Constructor arguments: `checkpoints_index` (default `langgraph_checkpoints`), `w
 
 ### Write visibility and refresh
 
-Writes use `refresh="wait_for"` by default, so a checkpoint is visible to `aget_tuple` and `alist` as soon as the write call returns. The cost is that each write call can wait up to one index refresh interval. To trade visibility for write latency, pass another value, for example `AsyncElasticsearchSaver(client, refresh=False)`. The argument is passed to Elasticsearch as the `refresh` parameter (`True`, `False` or `"wait_for"`).
+Writes use `refresh="wait_for"` by default, so a checkpoint is visible to `aget_tuple` and `alist` as soon as the write call returns. The cost is that each write call can wait up to one index refresh interval. To trade visibility for write latency, pass another value, for example `AsyncElasticsearchSaver(client, refresh=False)`. The argument is passed to Elasticsearch as the `refresh` parameter (`True`, `False` or `"wait_for"`; see the [Elasticsearch `refresh` docs](https://www.elastic.co/docs/reference/elasticsearch/rest-apis/refresh-parameter)).
+
+With `refresh=False`, a write becomes searchable only after the next periodic refresh (the index `refresh_interval`, 1 second by default). Until then, the next run may resume from an older "latest" checkpoint, and `adelete_thread` and `adelete_scoped_thread` can miss documents that are not yet refreshed.
 
 ## Async only
 
@@ -61,6 +83,12 @@ await owners.setup()
 claimed = await owners.claim_session("t1", "acme", "alice")  # bool
 owner = await owners.get_session_owner("t1")  # (tenant_id, user_id) or None
 ```
+
+Ownership is keyed by `thread_id` across all tenants: two tenants cannot both claim the same `thread_id`. Neither `adelete_thread` nor `adelete_scoped_thread` removes the owner record.
+
+## Limits
+
+Elasticsearch rejects document ids over 512 bytes, so very long thread, tenant or user ids or namespaces fail. Ids are percent-encoded for `:` and `%`.
 
 ## Index layout
 
